@@ -582,6 +582,8 @@ void main_loop(void)
                 h->num_sent_i++; /* count as sent for interval stats */
                 print_host_line(h, 0, 0, NULL);
                 stats_add(h, idx, 0, 0);
+                /* schedule the next ping for this host (count/retry/loop) */
+                schedule_next_ping(h);
             } else {
                 /* time to send ping #idx */
                 int rc = send_ping(h, idx);
