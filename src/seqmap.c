@@ -1,0 +1,82 @@
+/*
+ * seqmap.c: implementation of a mapping between sequence number and
+ * (host, ping_nr) -- identical logic to upstream fping.
+ *
+ * We can't just use ping_nr*host_count + host_nr, because it can
+ * overflow the 16 bit of the icmp header field.
+ */
+#include "winp.h"
+#include "seqmap.h"
+#include "fping.h"
+
+#include <limits.h>
+#include <inttypes.h>
+
+static SEQMAP_VALUE *seqmap_map = NULL;
+static unsigned int seqmap_next_id = 0;
+static int64_t seqmap_timeout_in_ns;
+
+#define SEQMAP_UNASSIGNED_HOST_NR UINT_MAX
+
+void seqmap_init(int64_t timeout)
+{
+    seqmap_timeout_in_ns = timeout;
+    seqmap_map = (SEQMAP_VALUE *)calloc(SEQMAP_MAXSEQ, sizeof(SEQMAP_VALUE));
+    if (seqmap_map == NULL) {
+        perror("malloc error (can't allocate seqmap_map)");
+    }
+}
+
+unsigned int seqmap_add(unsigned int host_nr, unsigned int ping_count, int64_t timestamp)
+{
+    unsigned int current_id;
+    SEQMAP_VALUE *next_value;
+
+    if (!seqmap_map) {
+        fprintf(stderr, "fping internal error: seqmap not initialized.\n");
+        exit(4);
+    }
+
+    /* check if expired (note that unused seqmap values will have fields set to
+     * 0, so will be seen as expired) */
+    next_value = &seqmap_map[seqmap_next_id];
+    if (next_value->ping_ts != 0 && timestamp - next_value->ping_ts < seqmap_timeout_in_ns) {
+        fprintf(stderr, "fping error: not enough sequence numbers available! (expire_timeout=%" PRId64 ", host_nr=%d, ping_count=%d, seqmap_next_id=%d)\n",
+            seqmap_timeout_in_ns, host_nr, ping_count, seqmap_next_id);
+        exit(4);
+    }
+
+    /* store the value */
+    next_value->host_nr = host_nr;
+    next_value->ping_count = ping_count;
+    next_value->ping_ts = timestamp;
+
+    /* increase next id */
+    current_id = seqmap_next_id;
+    seqmap_next_id = (seqmap_next_id + 1) % SEQMAP_MAXSEQ;
+
+    dbg_printf("seqmap_add(host: %d, index: %d) -> %d\n", host_nr, ping_count, current_id);
+
+    return current_id;
+}
+
+SEQMAP_VALUE *seqmap_fetch(unsigned int id, int64_t now)
+{
+    SEQMAP_VALUE *value;
+
+    if (id >= SEQMAP_MAXSEQ) {
+        return NULL;
+    }
+
+    value = &seqmap_map[id];
+
+    /* verify that value is not expired */
+    if (now - value->ping_ts >= seqmap_timeout_in_ns) {
+        dbg_printf("seqmap_fetch(%d) -> DISCARDED\n", id);
+        return NULL;
+    }
+
+    dbg_printf("seqmap_fetch(%d) -> host: %d, index: %d\n", id, value->host_nr, value->ping_count);
+
+    return value;
+}
