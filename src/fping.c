@@ -50,7 +50,7 @@ static int   opt_per_recv       = 0; /* -p (period, ms) */
 int64_t report_interval_ns = 0; /* -Q */
 static int   opt_print_timestamp = 0; /* -D */
 static int   opt_name_lookup    = 1;
-static int   opt_netdb          = 1;
+static int   opt_netdb          = 0; /* -n enables reverse-DNS names (default: numeric, like upstream -A) */
 static int   opt_ipv6           = 0; /* -6 */
 static int   opt_random_data    = 0;
 static char *opt_src_addr_str   = NULL; /* -S */
@@ -410,18 +410,17 @@ static void print_host_line(HOST_ENTRY *h, int success, int64_t latency, const c
     if (success) {
         printf("%-s", h->host);
         if (opt_alive_flag && !opt_show_latency && !opt_eliminate) {
-            /* upstream -a prints just the host name */
+            /* upstream -a prints just the host name/address */
         } else {
             printf(" is alive");
             if (opt_show_latency || opt_eliminate)
                 printf(" (%.2f ms)", (double)latency / 1000000.0);
         }
-        if (reply_addr && *reply_addr && strcmp(reply_addr, h->host) != 0)
-            printf(" [%s]", reply_addr);
         printf("\n");
     } else {
         printf("%-s is unreachable\n", h->host);
     }
+    fflush(stdout);
 }
 
 void print_perhost_stats(void)
@@ -518,12 +517,24 @@ void handle_reply(HOST_ENTRY *h, int seq_nr, int64_t latency_ns, int success,
     if (success) {
         num_pingreceived++;
         stats_add(h, seq_nr, 1, latency_ns);
-        print_host_line(h, 1, latency_ns, reply_addr);
+        /* print "is alive" only on the FIRST reply for this host
+         * (upstream: if (h->num_recv == 1)).  In loop/count per-recv mode
+         * every reply is printed via print_host_line instead. */
+        if (h->num_recv == 1) {
+            if (opt_alive_flag || opt_unreachable || opt_verbose)
+                print_host_line(h, 1, latency_ns, reply_addr);
+        } else if (opt_loop || opt_count) {
+            if (!opt_quiet)
+                print_host_line(h, 1, latency_ns, reply_addr);
+        }
     } else {
         /* error from the echo request itself (e.g. host unreachable) */
         num_othericmprcvd++;
         stats_add(h, seq_nr, 0, 0);
-        print_host_line(h, 0, 0, NULL);
+        if (opt_loop || opt_count) {
+            if (!opt_quiet)
+                print_host_line(h, 0, 0, NULL);
+        }
     }
 
     /* cancel the pending timeout event for this ping */
@@ -531,7 +542,10 @@ void handle_reply(HOST_ENTRY *h, int seq_nr, int64_t latency_ns, int success,
     if (timeout_ev)
         ev_remove(&ev_queue, timeout_ev);
 
-    schedule_next_ping(h);
+    /* default (scan) mode retries only on failure, not on success;
+     * loop/count schedule the next ping right after send in main_loop */
+    if (!success)
+        schedule_next_ping(h);
 }
 
 /* ---- main loop ------------------------------------------------------------- */
@@ -768,7 +782,7 @@ int main(int argc, char **argv)
         case 'g': opt_generate = 1; break;
         case 'i': opt_interval_ns = (int64_t)atoi(opts.optarg) * 1000000LL; break;
         case 'l': opt_loop = 1; break;
-        case 'n': opt_name_lookup = 1; break;
+        case 'n': opt_netdb = 1; break;
         case 'p':
             opt_per_recv = 1;
             opt_perhost_interval = (int64_t)atoi(opts.optarg) * 1000000LL;
