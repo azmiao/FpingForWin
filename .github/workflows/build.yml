@@ -33,13 +33,11 @@ jobs:
           ./fping.exe -h
 
       - name: Package
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp fping.exe dist/
-          cd dist
-          zip -9 ../fping-windows-x64.zip fping.exe
-          cd ..
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item fping.exe dist/
+          Compress-Archive -Path dist/fping.exe -DestinationPath fping-windows-x64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
