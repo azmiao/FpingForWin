@@ -110,18 +110,34 @@ int socket_sendto_ping_ipv4(HOST_ENTRY *h, uint16_t seq_nr)
     r->sent_time_ns = current_time_ns;
     r->used = 1;
 
-    rc = IcmpSendEcho2(hIcmp,
-                       r->event,
-                       NULL,     /* no APC */
-                       NULL,     /* no APC context */
-                       opt_src_addr_ipv4,
-                       sin->sin_addr.s_addr,
-                       ping_data_ipv4,
-                       (WORD)ping_data_size_ipv4,
-                       NULL,     /* default IP options */
-                       r->reply_buf,
-                       sizeof(r->reply_buf),
-                       1000);    /* per-call timeout (we do our own timing) */
+    /* IcmpSendEcho2Ex is the variant that accepts a source address (-S).
+     * When no source address is set we use plain IcmpSendEcho2. */
+    if (opt_src_addr_ipv4 != 0) {
+        rc = IcmpSendEcho2Ex(hIcmp,
+                             r->event,
+                             NULL,     /* no APC */
+                             NULL,     /* no APC context */
+                             opt_src_addr_ipv4,
+                             sin->sin_addr.s_addr,
+                             ping_data_ipv4,
+                             (WORD)ping_data_size_ipv4,
+                             NULL,     /* default IP options */
+                             r->reply_buf,
+                             sizeof(r->reply_buf),
+                             1000);
+    } else {
+        rc = IcmpSendEcho2(hIcmp,
+                           r->event,
+                           NULL,     /* no APC */
+                           NULL,     /* no APC context */
+                           sin->sin_addr.s_addr,
+                           ping_data_ipv4,
+                           (WORD)ping_data_size_ipv4,
+                           NULL,     /* default IP options */
+                           r->reply_buf,
+                           sizeof(r->reply_buf),
+                           1000);    /* per-call timeout (we do our own timing) */
+    }
 
     if (rc == 0) {
         DWORD err = GetLastError();

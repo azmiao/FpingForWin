@@ -9,11 +9,13 @@
 
 #include <stdint.h>
 
-#define ICMP_ECHOREPLY      0
-#define ICMP_ECHO           8
-#define ICMP_TSTAMP         13
-#define ICMP_TSTAMPREPLY    14
-#define ICMP_MINLEN         8
+/* These names collide with macros in <icmpapi.h> / <ws2tcpip.h>, so we
+ * prefix ours with FPING_.  Layout values follow RFC 792 / RFC 4443. */
+#define FPING_ICMP_ECHOREPLY      0
+#define FPING_ICMP_ECHO           8
+#define FPING_ICMP_TSTAMP         13
+#define FPING_ICMP_TSTAMPREPLY    14
+#define FPING_ICMP_MINLEN         8
 
 /* ICMPv6 types */
 #define ICMP6_ECHO_REQUEST  128
