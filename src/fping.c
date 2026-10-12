@@ -34,6 +34,7 @@
 static int   opt_count          = DEFAULT_COUNT;
 static int   opt_loop           = 1;
 static int64_t opt_timeout_ns   = DEFAULT_TIMEOUT_MS * 1000000LL;
+int64_t fping_timeout_ns        = DEFAULT_TIMEOUT_MS * 1000000LL; /* exposed to socket layer */
 static int64_t opt_interval_ns  = DEFAULT_INTERVAL_MS * 1000000LL;
 static int   opt_retry          = DEFAULT_RETRY;
 static int   opt_backoff        = 1; /* -B factor */
@@ -174,10 +175,11 @@ void add_addr(char *name, char *host, struct sockaddr *ipaddr, socklen_t ipaddr_
     h->timeout = opt_timeout_ns;
     h->min_reply = -1;
     h->min_reply_i = -1;
+    h->ring_size = opt_count + opt_retry + 2;
     h->event_storage_ping = (struct event *)calloc(
-        (size_t)(opt_count + opt_retry + 2), sizeof(struct event));
+        (size_t)h->ring_size, sizeof(struct event));
     h->event_storage_timeout = (struct event *)calloc(
-        (size_t)(opt_count + opt_retry + 2), sizeof(struct event));
+        (size_t)h->ring_size, sizeof(struct event));
     if (opt_count > 0)
         h->resp_times = (int64_t *)calloc((size_t)(opt_count + 1), sizeof(int64_t));
 
@@ -317,25 +319,29 @@ void ev_remove(struct event_queue *queue, struct event *event)
 
 void host_add_ping_event(HOST_ENTRY *h, int index, int64_t ev_time)
 {
-    struct event *e = &h->event_storage_ping[index];
+    /* ring-buffer the per-host event storage (same as upstream
+     * index % event_storage_count) so loop mode does not overflow */
+    struct event *e = &h->event_storage_ping[index % h->ring_size];
     e->host = h;
     e->ping_index = index;
     e->ev_time = ev_time;
+    e->is_timeout = 0;
     ev_enqueue(&ev_queue, e);
 }
 
 void host_add_timeout_event(HOST_ENTRY *h, int index, int64_t ev_time)
 {
-    struct event *e = &h->event_storage_timeout[index];
+    struct event *e = &h->event_storage_timeout[index % h->ring_size];
     e->host = h;
     e->ping_index = index;
     e->ev_time = ev_time;
+    e->is_timeout = 1;
     ev_enqueue(&ev_queue, e);
 }
 
 struct event *host_get_timeout_event(HOST_ENTRY *h, int index)
 {
-    return &h->event_storage_timeout[index];
+    return &h->event_storage_timeout[index % h->ring_size];
 }
 
 /* ---- statistics ----------------------------------------------------------- */
@@ -361,7 +367,7 @@ void stats_add(HOST_ENTRY *h, int index, int success, int64_t latency)
         if (latency > h->max_reply_i) h->max_reply_i = latency;
         if (h->min_reply_i < 0 || latency < h->min_reply_i) h->min_reply_i = latency;
         h->total_time_i += latency;
-        if (h->resp_times)
+        if (h->resp_times && index <= opt_count)
             h->resp_times[index] = latency;
         if (latency > max_reply) max_reply = latency;
         if (min_reply < 0 || latency < min_reply) min_reply = latency;
@@ -483,27 +489,20 @@ int send_ping(HOST_ENTRY *h, int index)
  * handle_reply - called from the socket layer when an echo completes.
  */
 /*
- * schedule_next_ping - decide whether host h gets another ping, and if so
- * enqueue the event.  Works for both loop mode and count/retry mode.
+ * schedule_next_ping - retry logic for default (non-loop, non-count) mode.
+ * In loop/count mode the next ping is scheduled right after send_ping()
+ * in the main loop (mirroring upstream fping), not here.
  */
 static void schedule_next_ping(HOST_ENTRY *h)
 {
-    int limit;
-
     if (sigint_received)
         return;
 
-    if (opt_loop) {
-        limit = opt_count + opt_retry + 1; /* effectively unbounded storage */
-        if (h->num_sent < limit)
+    /* default mode: retry up to opt_retry times */
+    if (!opt_loop && !opt_count) {
+        if (h->num_sent < opt_retry + 1)
             host_add_ping_event(h, h->num_sent, current_time_ns + opt_interval_ns);
-        return;
     }
-
-    /* count mode: total allowed sends = count + retry */
-    limit = opt_count + opt_retry;
-    if (h->num_sent < limit)
-        host_add_ping_event(h, h->num_sent, current_time_ns + opt_interval_ns);
 }
 
 void handle_reply(HOST_ENTRY *h, int seq_nr, int64_t latency_ns, int success,
@@ -570,11 +569,7 @@ void main_loop(void)
             struct event *e = ev_dequeue(&ev_queue);
             HOST_ENTRY *h = e->host;
             int idx = e->ping_index;
-
-            /* is this a ping event or a timeout event?  Distinguish by
-             * which storage array it came from. */
-            int is_timeout = (e >= h->event_storage_timeout &&
-                              e < h->event_storage_timeout + opt_count + opt_retry + 2);
+            int is_timeout = e->is_timeout;
 
             if (is_timeout) {
                 /* timeout for ping #idx */
@@ -582,7 +577,7 @@ void main_loop(void)
                 h->num_sent_i++; /* count as sent for interval stats */
                 print_host_line(h, 0, 0, NULL);
                 stats_add(h, idx, 0, 0);
-                /* schedule the next ping for this host (count/retry/loop) */
+                /* default mode: maybe retry (loop/count schedule on send) */
                 schedule_next_ping(h);
             } else {
                 /* time to send ping #idx */
@@ -590,6 +585,12 @@ void main_loop(void)
                 if (rc == 0) {
                     host_add_timeout_event(h, idx,
                         current_time_ns + h->timeout * opt_backoff);
+                    /* loop & count mode: schedule the next ping right after
+                     * sending (mirrors upstream fping main loop) */
+                    if (opt_loop || (opt_count && idx + 1 < opt_count)) {
+                        host_add_ping_event(h, idx + 1,
+                            e->ev_time + opt_interval_ns);
+                    }
                 }
             }
         }
@@ -776,7 +777,7 @@ int main(int argc, char **argv)
         case 'r': opt_retry = atoi(opts.optarg); break;
         case 's': opt_stats = 1; break;
         case 'S': opt_src_addr_str = opts.optarg; break;
-        case 't': opt_timeout_ns = (int64_t)atoi(opts.optarg) * 1000000LL; break;
+        case 't': opt_timeout_ns = (int64_t)atoi(opts.optarg) * 1000000LL; fping_timeout_ns = opt_timeout_ns; break;
         case 'u': opt_unreachable = 1; opt_quiet = 1; break;
         case 'v':
             printf("fping for Windows, version 1.0.0\n");

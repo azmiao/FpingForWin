@@ -77,7 +77,8 @@ int socket_sendto_ping_ipv6(HOST_ENTRY *h, uint16_t seq_nr)
         return -1;
 
     if (!r->event) {
-        r->event = CreateEvent(NULL, FALSE, FALSE, NULL);
+        /* manual-reset event (see socket4_win.c for the rationale) */
+        r->event = CreateEvent(NULL, TRUE, FALSE, NULL);
         if (!r->event)
             return -1;
     } else {
@@ -89,18 +90,25 @@ int socket_sendto_ping_ipv6(HOST_ENTRY *h, uint16_t seq_nr)
     r->sent_time_ns = current_time_ns;
     r->used = 1;
 
-    rc = Icmp6SendEcho2(hIcmp6,
-                        r->event,
-                        NULL,
-                        NULL,
-                        &opt_src_addr6,
-                        dst,
-                        ping_data_ipv6,
-                        (WORD)ping_data_size_ipv6,
-                        NULL,
-                        r->reply_buf,
-                        sizeof(r->reply_buf),
-                        1000);
+    /* see socket4_win.c for why the system timeout is 2x the fping timeout */
+    {
+        DWORD sys_timeout = (DWORD)(fping_timeout_ns / 1000000LL) * 2;
+        if (sys_timeout == 0)
+            sys_timeout = 1;
+
+        rc = Icmp6SendEcho2(hIcmp6,
+                            r->event,
+                            NULL,
+                            NULL,
+                            &opt_src_addr6,
+                            dst,
+                            ping_data_ipv6,
+                            (WORD)ping_data_size_ipv6,
+                            NULL,
+                            r->reply_buf,
+                            sizeof(r->reply_buf),
+                            sys_timeout);
+    }
 
     if (rc == 0) {
         DWORD err = GetLastError();
@@ -146,9 +154,11 @@ int socket6_drain(void)
 {
     int i;
     int processed = 0;
+    /* manual-reset events: reset explicitly after handling */
     for (i = 0; i < MAX6_OUTSTANDING; i++) {
         if (reqs6[i].used && WaitForSingleObject(reqs6[i].event, 0) == WAIT_OBJECT_0) {
             req6_process(&reqs6[i]);
+            ResetEvent(reqs6[i].event);
             processed++;
         }
     }

@@ -36,12 +36,16 @@ typedef struct host_entry {
 
     /* windows async completion: one OVERLAPPED/event per outstanding ping */
     void *win_ping_handle;          /* IcmpHandle used for this host */
+
+    int ring_size;                  /* size of the per-host event ring */
 } HOST_ENTRY;
 
 struct event {
     HOST_ENTRY *host;
     int ping_index;
     int64_t ev_time;
+    int in_queue;   /* 1 while this event sits in the queue */
+    int is_timeout; /* 1 = timeout event, 0 = send-ping event */
     struct event *ev_next;
     struct event *ev_prev;
 };
@@ -81,6 +85,7 @@ extern int opt_debug_trace_on;
 /* ---- fping.c ------------------------------------------------------------ */
 
 void add_name(char *name);
+extern int64_t fping_timeout_ns; /* per-target timeout shared with socket layer */
 void add_addr(char *name, char *host, struct sockaddr *ipaddr, socklen_t ipaddr_len);
 char *na_cat(char *name, struct in_addr ipaddr);
 int send_ping(HOST_ENTRY *h, int index);

@@ -98,7 +98,10 @@ int socket_sendto_ping_ipv4(HOST_ENTRY *h, uint16_t seq_nr)
     }
 
     if (!r->event) {
-        r->event = CreateEvent(NULL, FALSE, FALSE, NULL);
+        /* manual-reset event: WaitForMultipleObjects() must NOT consume the
+         * signal, otherwise the drain loop below would see the event as
+         * unsignalled and the completed reply would be dropped. */
+        r->event = CreateEvent(NULL, TRUE, FALSE, NULL);
         if (!r->event)
             return -1;
     } else {
@@ -109,6 +112,14 @@ int socket_sendto_ping_ipv4(HOST_ENTRY *h, uint16_t seq_nr)
     r->seq_nr = seq_nr;
     r->sent_time_ns = current_time_ns;
     r->used = 1;
+
+    /* System-level timeout for the echo request.  fping's own event queue
+     * applies the real per-target timeout; we give the OS a little headroom
+     * (2x, min 1ms) so a late reply is not failed by the API before fping
+     * itself has decided the packet timed out. */
+    DWORD sys_timeout = (DWORD)(fping_timeout_ns / 1000000LL) * 2;
+    if (sys_timeout == 0)
+        sys_timeout = 1;
 
     /* IcmpSendEcho2Ex is the variant that accepts a source address (-S).
      * When no source address is set we use plain IcmpSendEcho2. */
@@ -124,7 +135,7 @@ int socket_sendto_ping_ipv4(HOST_ENTRY *h, uint16_t seq_nr)
                              NULL,     /* default IP options */
                              r->reply_buf,
                              sizeof(r->reply_buf),
-                             1000);
+                             sys_timeout);
     } else {
         rc = IcmpSendEcho2(hIcmp,
                            r->event,
@@ -136,7 +147,7 @@ int socket_sendto_ping_ipv4(HOST_ENTRY *h, uint16_t seq_nr)
                            NULL,     /* default IP options */
                            r->reply_buf,
                            sizeof(r->reply_buf),
-                           1000);    /* per-call timeout (we do our own timing) */
+                           sys_timeout);
     }
 
     if (rc == 0) {
@@ -222,10 +233,13 @@ int wait_and_process_replies(int64_t timeout_ns)
     WaitForMultipleObjects(n, handles, FALSE, wait_ms);
     update_current_time();
 
-    /* drain all signalled IPv4 requests */
+    /* drain all signalled IPv4 requests.  The events are manual-reset, so
+     * after WaitForMultipleObjects() every completed request is still
+     * signalled; we must ResetEvent() explicitly once it is handled. */
     for (i = 0; i < MAX_OUTSTANDING; i++) {
         if (reqs[i].used && WaitForSingleObject(reqs[i].event, 0) == WAIT_OBJECT_0) {
             req_process(&reqs[i]);
+            ResetEvent(reqs[i].event);
             processed++;
         }
     }
