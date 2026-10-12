@@ -67,16 +67,22 @@ static void optparse_permute(struct optparse *options, int index)
 
 static int optparse_argtype(const char *optstring, char c)
 {
-    int count = OPTPARSE_INVALID;
+    int i;
     if (c == ':')
         return -1;
-    for (; *optstring && c != *optstring; optstring++)
-        ;
-    if (!*optstring)
-        return -1;
-    if (optstring[1] == ':')
-        count += optstring[2] == ':' ? 2 : 1;
-    return count;
+    for (i = 0; optstring[i]; i++) {
+        if (optstring[i] == ':')
+            continue; /* ':' is an argument marker, never an option char */
+        if (optstring[i] == c) {
+            /* option found; count ':' that follow */
+            if (optstring[i + 1] != ':')
+                return 0; /* no argument */
+            if (optstring[i + 2] == ':')
+                return 2; /* optional argument */
+            return 1;     /* required argument */
+        }
+    }
+    return -1;
 }
 
 int optparse(struct optparse *options, const char *optstring)
