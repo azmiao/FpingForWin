@@ -113,6 +113,7 @@ void errno_crash_and_burn(char *message);
 
 int  open_ping_socket_ipv4(void);
 void init_ping_buffer_ipv4(size_t ping_data_size);
+void socket_set_src_addr_ipv4(struct in_addr *src_addr);
 int  socket_sendto_ping_ipv4(HOST_ENTRY *h, uint16_t seq_nr);
 int  wait_and_process_replies(int64_t timeout_ns);
 
