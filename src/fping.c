@@ -392,15 +392,15 @@ const char *sprint_tm(int64_t t)
 
 static void print_host_line(HOST_ENTRY *h, int success, int64_t latency, const char *reply_addr)
 {
-    if (opt_quiet)
-        return;
+    /* -a: only alive hosts;  -u: only unreachable hosts.  These are the
+     * "scanning" modes and MUST print matching hosts even when quiet. */
     if (opt_alive_flag && !success)
         return;
     if (opt_unreachable && success)
         return;
-    if (!opt_alive_flag && !opt_unreachable) {
-        /* default: show both */
-    }
+    /* plain -q/-c count mode: suppress per-ping output, but not -a/-u */
+    if (opt_quiet && !opt_alive_flag && !opt_unreachable)
+        return;
 
     if (opt_print_timestamp) {
         int64_t sec = win_wallclock_sec();
@@ -408,9 +408,14 @@ static void print_host_line(HOST_ENTRY *h, int success, int64_t latency, const c
     }
 
     if (success) {
-        printf("%-s is alive", h->host);
-        if (opt_show_latency || opt_eliminate)
-            printf(" (%.2f ms)", (double)latency / 1000000.0);
+        printf("%-s", h->host);
+        if (opt_alive_flag && !opt_show_latency && !opt_eliminate) {
+            /* upstream -a prints just the host name */
+        } else {
+            printf(" is alive");
+            if (opt_show_latency || opt_eliminate)
+                printf(" (%.2f ms)", (double)latency / 1000000.0);
+        }
         if (reply_addr && *reply_addr && strcmp(reply_addr, h->host) != 0)
             printf(" [%s]", reply_addr);
         printf("\n");
@@ -740,7 +745,7 @@ int main(int argc, char **argv)
     }
 
     /* defaults */
-    opt_eliminate = 1;
+    opt_eliminate = 0;   /* latency shown only with -e (or count-mode stats) */
     opt_show_latency = 0;
 
     optparse_init(&opts, argv);
