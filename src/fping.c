@@ -272,20 +272,44 @@ void ev_enqueue(struct event_queue *queue, struct event *event)
 {
     struct event *p;
 
-    /* insert sorted by ev_time (ascending).  Most events go near the head. */
-    for (p = queue->first; p != NULL && p->ev_time <= event->ev_time; p = p->ev_next)
+    /* The queue is sorted ascending by ev_time, so queue->first is the
+     * earliest event.  New events almost always have the LARGEST ev_time
+     * (next ping / timeout), so we scan from the tail backwards -- this
+     * makes insertion O(1) in the common case (same as upstream fping). */
+
+    /* Empty list */
+    if (queue->last == NULL) {
+        event->ev_next = NULL;
+        event->ev_prev = NULL;
+        queue->first = event;
+        queue->last = event;
+        return;
+    }
+
+    /* Insert on tail? (fast path: new event is the latest) */
+    if (event->ev_time - queue->last->ev_time >= 0) {
+        event->ev_next = NULL;
+        event->ev_prev = queue->last;
+        queue->last->ev_next = event;
+        queue->last = event;
+        return;
+    }
+
+    /* Find insertion point scanning backwards from the tail */
+    for (p = queue->last; p != NULL && p->ev_time > event->ev_time; p = p->ev_prev)
         ;
 
-    event->ev_prev = p ? p->ev_prev : queue->last;
-    event->ev_next = p;
+    /* insert after p (p may be NULL -> new head) */
+    event->ev_prev = p;
+    event->ev_next = p ? p->ev_next : queue->first;
     if (p)
-        p->ev_prev = event;
-    else
-        queue->last = event;
-    if (event->ev_prev)
-        event->ev_prev->ev_next = event;
+        p->ev_next = event;
     else
         queue->first = event;
+    if (event->ev_next)
+        event->ev_next->ev_prev = event;
+    else
+        queue->last = event;
 }
 
 struct event *ev_dequeue(struct event_queue *queue)
