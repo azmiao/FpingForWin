@@ -1,24 +1,6 @@
-# fping for Windows
+# Fping for Windows
 
-一个基于 [schweikert/fping](https://github.com/schweikert/fping) 设计逻辑移植到 Windows 的
-快速 ping 工具，使用纯 C + Winsock / IP Helper API 实现，无需第三方依赖，产出
-**单个零依赖 `fping.exe`**。
-
-## 与上游 fping 的关系
-
-本项目完整保留了 fping 的核心设计：
-
-| 设计要点 | 上游实现 | Windows 实现 |
-|---|---|---|
-| 异步轮询主循环 | `select()` + 事件队列 | `WaitForMultipleObjects()` + 相同事件队列 |
-| 多主机 round-robin 发包 | ✅ | ✅ |
-| 序列号映射（seqmap） | raw ICMP seq 字段 | OS 构造报文，用请求上下文映射 |
-| 事件驱动超时检测 | 预分配 event 结构 | 完全相同 |
-| Socket 层 | raw socket (需 root) | `IcmpSendEcho2` (普通用户即可) |
-| 时间源 | `clock_gettime` | `QueryPerformanceCounter` |
-
-**平台相关代码被隔离在 `socket4_win.c` / `socket6_win.c`**，主逻辑 `fping.c`
-的控制流与上游保持一致，方便跟随上游演进。
+一个基于 [schweikert/fping](https://github.com/schweikert/fping) 设计逻辑移植到 Windows 的 fping 工具
 
 ## 功能
 
@@ -36,19 +18,9 @@
 需要 MinGW-w64（gcc）：
 
 ```sh
-make            # 产出 fping.exe
+make
 make clean
 ```
-
-无需任何第三方库。
-
-## CI 自动编译打包
-
-`.github/workflows/build.yml` 在以下时机触发：
-
-- **push 到 main/master**：编译 → 冒烟测试 → 上传 `fping-windows-x64.zip` artifact
-- **打 `v*` tag**：额外创建 GitHub Release 并附带 zip
-- **手动触发**（workflow_dispatch）
 
 ## 使用示例
 
