@@ -32,7 +32,7 @@
 #define DEFAULT_COUNT          0 /* 0 = loop mode */
 
 static int   opt_count          = DEFAULT_COUNT;
-static int   opt_loop           = 1;
+static int   opt_loop           = 0; /* -l enables loop mode; default is single-shot + retry */
 static int64_t opt_timeout_ns   = DEFAULT_TIMEOUT_MS * 1000000LL;
 int64_t fping_timeout_ns        = DEFAULT_TIMEOUT_MS * 1000000LL; /* exposed to socket layer */
 static int64_t opt_interval_ns  = DEFAULT_INTERVAL_MS * 1000000LL;
@@ -546,10 +546,6 @@ void handle_reply(HOST_ENTRY *h, int seq_nr, int64_t latency_ns, int success,
     if (timeout_ev)
         ev_remove(&ev_queue, timeout_ev);
 
-    if (getenv("FPING_DEBUG"))
-        fprintf(stderr, "[dbg] handle_reply host=%s seq=%d success=%d num_sent=%d\n",
-                h->host, seq_nr, success, h->num_sent);
-
     /* default (scan) mode retries only on failure, not on success;
      * loop/count schedule the next ping right after send in main_loop */
     if (!success)
@@ -580,8 +576,6 @@ void main_loop(void)
 
         if (!ev) {
             /* no more events and nothing outstanding -> done */
-            if (getenv("FPING_DEBUG"))
-                fprintf(stderr, "[dbg] event queue empty, breaking main loop\n");
             break;
         }
 
@@ -606,9 +600,6 @@ void main_loop(void)
                 h->num_sent_i++; /* count as sent for interval stats */
                 print_host_line(h, 0, 0, NULL);
                 stats_add(h, idx, 0, 0);
-                if (getenv("FPING_DEBUG"))
-                    fprintf(stderr, "[dbg] timeout host=%s idx=%d num_sent=%d\n",
-                            h->host, idx, h->num_sent);
                 /* default mode: maybe retry (loop/count schedule on send) */
                 schedule_next_ping(h);
             } else {
