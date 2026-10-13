@@ -1,5 +1,19 @@
 # 更新日志
 
+## 1.0.2 (2026-10-13)
+
+### ✨ 新功能
+
+- 对齐上游fping命令格式与回显——默认值(-i=10/-r=3/-B=1.5/-p=1000)、per-ping回显格式([seq]+bytes+avg+loss)、-C逐包耗时、-Q周期统计、统计走stderr、-D时间戳5位小数、-t在loop/count自动取-p、-g生成上限、指数退避 @azmiao
+
+### 🐛 Bug 修复
+
+- usage的-t默认值缺少printf参数读出栈垃圾；scan模式不可达改为finish()末尾只打一次(对齐上游)，去掉主循环逐次重复打印 @azmiao
+
+### 🧹 日常维护
+
+- 更新 CHANGELOG @github-actions[bot]
+
 ## 1.0.1 (2026-10-13)
 
 ### 🚀 性能优化
