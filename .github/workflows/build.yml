@@ -9,6 +9,10 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ------------------------------------------------------------------ #
+  # Compile fping.exe for x64 and arm64, upload both as artifacts.     #
+  # Runs on every push / PR / manual trigger.                          #
+  # ------------------------------------------------------------------ #
   build:
     runs-on: windows-latest
     strategy:
@@ -80,11 +84,114 @@ jobs:
           path: fping-windows-${{ matrix.arch }}.zip
           retention-days: 30
 
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  # ------------------------------------------------------------------ #
+  # Extract the release tag (only meaningful for tag pushes).          #
+  # ------------------------------------------------------------------ #
+  metadata:
+    name: Metadata
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Compute tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ #
+  # Generate the changelog for this tag (release-notes.md) and refresh #
+  # the cumulative CHANGELOG.md on the default branch.  Tag pushes only.#
+  # ------------------------------------------------------------------ #
+  changelog:
+    name: Generate changelog
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Generate release notes and full changelog
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python scripts/generate_changelog.py --tag "$RELEASE_TAG" > release-notes.md
+          python scripts/generate_changelog.py --all --output CHANGELOG.md
+          test -s release-notes.md
+          test -s CHANGELOG.md
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Commit changelog to default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "CHANGELOG.md 无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore 🔧: 更新 CHANGELOG"
+          git push origin "HEAD:$DEFAULT_BRANCH"
+
+  # ------------------------------------------------------------------ #
+  # Publish the GitHub Release with the generated changelog as the     #
+  # body and both architecture zips attached.  Tag pushes only.        #
+  # ------------------------------------------------------------------ #
+  release:
+    name: Publish GitHub Release
+    needs: [metadata, build, changelog]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+
+      - name: Download release metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: assets/metadata
+
+      - name: Verify assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s assets/metadata/release-notes.md
+          test -s "assets/fping-windows-x64/fping-windows-x64.zip"
+          test -s "assets/fping-windows-arm64/fping-windows-arm64.zip"
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: fping-windows-${{ matrix.arch }}.zip
-          generate_release_notes: true
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: ${{ needs.metadata.outputs.tag }}
+          body_path: assets/metadata/release-notes.md
+          files: |
+            assets/fping-windows-x64/fping-windows-x64.zip
+            assets/fping-windows-arm64/fping-windows-arm64.zip
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
