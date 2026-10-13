@@ -30,11 +30,20 @@ typedef struct ping_req {
     int seq_nr;
     int64_t sent_time_ns;
     HANDLE event;
+    /* free-list / active-list links (index-based, -1 = end) */
+    int next;
+    int prev;
     char reply_buf[sizeof(ICMP_ECHO_REPLY) + 1024];
 } PING_REQ;
 
 static PING_REQ reqs[MAX_OUTSTANDING];
 static int req_count = 0;
+
+/* free stack: singly linked via .next, -1 terminates.  Allocation is O(1). */
+static int free_head = -1;
+/* active list: doubly linked via .next/.prev so we can collect and drain
+ * only the live requests instead of scanning all MAX_OUTSTANDING slots. */
+static int active_head = -1;
 
 static HANDLE hIcmp = NULL;
 static char *ping_data_ipv4 = NULL;
@@ -51,10 +60,15 @@ int open_ping_socket_ipv4(void)
         fprintf(stderr, "fping: IcmpCreateFile failed: %lu\n", GetLastError());
         return -1;
     }
+    /* build the free stack over all slots */
+    free_head = 0;
     for (i = 0; i < MAX_OUTSTANDING; i++) {
         reqs[i].used = 0;
         reqs[i].event = NULL;
+        reqs[i].next = (i + 1 < MAX_OUTSTANDING) ? (i + 1) : -1;
+        reqs[i].prev = -1;
     }
+    active_head = -1;
     return 0;
 }
 
@@ -71,14 +85,44 @@ void socket_set_src_addr_ipv4(struct in_addr *src_addr)
     opt_src_addr_ipv4 = src_addr->s_addr;
 }
 
+/* pop a free slot and link it into the active list */
 static PING_REQ *req_alloc(void)
 {
-    int i;
-    for (i = 0; i < MAX_OUTSTANDING; i++) {
-        if (!reqs[i].used)
-            return &reqs[i];
-    }
-    return NULL;
+    int idx;
+    PING_REQ *r;
+
+    if (free_head < 0)
+        return NULL; /* no free slot */
+
+    idx = free_head;
+    r = &reqs[idx];
+    free_head = r->next;
+
+    /* link at the head of the active list */
+    r->prev = -1;
+    r->next = active_head;
+    if (active_head >= 0)
+        reqs[active_head].prev = idx;
+    active_head = idx;
+
+    return r;
+}
+
+/* unlink a request from the active list and push it back on the free stack */
+static void req_release(PING_REQ *r)
+{
+    int idx = (int)(r - reqs);
+
+    if (r->prev >= 0)
+        reqs[r->prev].next = r->next;
+    else
+        active_head = r->next;
+    if (r->next >= 0)
+        reqs[r->next].prev = r->prev;
+
+    r->next = free_head;
+    r->prev = -1;
+    free_head = idx;
 }
 
 /*
@@ -188,6 +232,9 @@ static void req_process(PING_REQ *r)
         inet_ntop(AF_INET, &ra, addrbuf, sizeof(addrbuf));
     }
 
+    /* recycle the slot (removes it from the active list) before invoking
+     * handle_reply, which may immediately allocate a new request */
+    req_release(r);
     r->used = 0;
     req_count--;
 
@@ -209,15 +256,14 @@ int wait_and_process_replies(int64_t timeout_ns)
     DWORD rc;
     int processed = 0;
 
-    /* collect IPv4 outstanding events, remembering which slot each handle
-     * belongs to so the drain below only touches live handles (<= 64)
-     * instead of scanning the whole 4096-slot array again. */
-    for (i = 0; i < MAX_OUTSTANDING && n < MAXIMUM_WAIT_OBJECTS; i++) {
-        if (reqs[i].used) {
-            handles[n] = reqs[i].event;
-            req_idx[n] = i;
-            n++;
-        }
+    /* collect IPv4 outstanding events by walking the ACTIVE LIST only
+     * (O(number of live requests), not O(MAX_OUTSTANDING)).  Remember which
+     * slot each handle belongs to so the drain below only touches the
+     * handles we actually waited on (<= MAXIMUM_WAIT_OBJECTS). */
+    for (i = active_head; i >= 0 && n < MAXIMUM_WAIT_OBJECTS; i = reqs[i].next) {
+        handles[n] = reqs[i].event;
+        req_idx[n] = i;
+        n++;
     }
 
     /* collect IPv6 outstanding events (if any); mark them with -1 */
