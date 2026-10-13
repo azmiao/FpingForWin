@@ -107,10 +107,13 @@ jobs:
     needs: metadata
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (full history + tags)
+      - name: Checkout default branch (full history + tags)
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          # Stay on the default branch so the CHANGELOG.md commit can be
+          # pushed back cleanly.  fetch-depth: 0 pulls every tag, which the
+          # changelog script needs to compute per-version commit ranges.
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
       - name: Set up Python
