@@ -8,6 +8,12 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# The changelog job commits CHANGELOG.md back to the default branch and the
+# release job creates a GitHub Release, so the GITHUB_TOKEN needs write
+# access to repository contents (the default for new repos is read-only).
+permissions:
+  contents: write
+
 jobs:
   # ------------------------------------------------------------------ #
   # Compile fping.exe for x64 and arm64, upload both as artifacts.     #
