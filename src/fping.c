@@ -409,7 +409,11 @@ static void print_host_line(HOST_ENTRY *h, int success, int64_t latency, const c
 
     if (success) {
         printf("%-s", h->host);
-        if (opt_alive_flag && !opt_show_latency && !opt_eliminate) {
+        if ((opt_loop || opt_count) && !opt_alive_flag) {
+            /* per-recv mode (loop/count): always show the round-trip time,
+             * like upstream "xmt/rcv" per-ping output */
+            printf(" is alive (%.2f ms)", (double)latency / 1000000.0);
+        } else if (opt_alive_flag && !opt_show_latency && !opt_eliminate) {
             /* upstream -a prints just the host name/address */
         } else {
             printf(" is alive");
@@ -517,14 +521,14 @@ void handle_reply(HOST_ENTRY *h, int seq_nr, int64_t latency_ns, int success,
     if (success) {
         num_pingreceived++;
         stats_add(h, seq_nr, 1, latency_ns);
-        /* print "is alive" only on the FIRST reply for this host
-         * (upstream: if (h->num_recv == 1)).  In loop/count per-recv mode
-         * every reply is printed via print_host_line instead. */
-        if (h->num_recv == 1) {
-            if (opt_alive_flag || opt_unreachable || opt_verbose)
-                print_host_line(h, 1, latency_ns, reply_addr);
-        } else if (opt_loop || opt_count) {
+        if (opt_loop || opt_count) {
+            /* per-recv mode: print every reply (upstream print_recv) */
             if (!opt_quiet)
+                print_host_line(h, 1, latency_ns, reply_addr);
+        } else if (h->num_recv == 1) {
+            /* scan/default mode: print "is alive" only on the FIRST reply
+             * for this host (upstream: if (h->num_recv == 1)) */
+            if (opt_alive_flag || opt_unreachable || opt_verbose)
                 print_host_line(h, 1, latency_ns, reply_addr);
         }
     } else {
