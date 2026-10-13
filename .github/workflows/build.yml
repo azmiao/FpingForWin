@@ -11,44 +11,80 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            triple: x86_64-w64-mingw32
+          - arch: arm64
+            triple: aarch64-w64-mingw32
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up MinGW-w64
-        uses: egor-tensin/setup-mingw@v2
-        with:
-          platform: x64
-          static: true
+      # llvm-mingw provides both x86_64-w64-mingw32-clang and
+      # aarch64-w64-mingw32-clang in a single toolchain.  We pin a release
+      # for reproducible builds.
+      - name: Set up llvm-mingw
+        shell: pwsh
+        run: |
+          $ver = "20251216"
+          $zip = "llvm-mingw-$ver-ucrt-x86_64.zip"
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$ver/$zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\llvm-mingw"
+          $bin = Get-ChildItem "$env:RUNNER_TEMP\llvm-mingw" -Directory | Select-Object -First 1
+          echo "$($bin.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "LLVM_MINGW_BIN=$($bin.FullName)\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Build
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          & "x86_64-w64-mingw32-clang" --version | Select-Object -First 1
+          & "aarch64-w64-mingw32-clang" --version | Select-Object -First 1
+
+      - name: Build (${{ matrix.arch }})
         shell: bash
         run: |
           make clean || true
-          make CC=gcc
+          make TRIPLE=${{ matrix.triple }}
 
-      - name: Smoke test
+      - name: Smoke test (x64 only)
+        if: matrix.arch == 'x64'
+        shell: pwsh
         run: |
           ./fping.exe -v
           ./fping.exe -h
+        # arm64 binary cannot run on the x64 runner; we only verify it links.
+
+      - name: Verify PE architecture
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("fping.exe")
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $archName = switch ($machine) { 0x8664 { "x64 (AMD64)" } 0xAA64 { "ARM64" } default { "unknown (0x{0:X4})" -f $machine } }
+          Write-Host "fping.exe machine type: $archName"
 
       - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path fping.exe -DestinationPath fping-windows-x64.zip -Force
+          Compress-Archive -Path fping.exe -DestinationPath "fping-windows-${{ matrix.arch }}.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fping-windows-x64
-          path: fping-windows-x64.zip
+          name: fping-windows-${{ matrix.arch }}
+          path: fping-windows-${{ matrix.arch }}.zip
           retention-days: 30
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: fping-windows-x64.zip
+          files: fping-windows-${{ matrix.arch }}.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
