@@ -202,21 +202,31 @@ static void req_process(PING_REQ *r)
 int wait_and_process_replies(int64_t timeout_ns)
 {
     HANDLE handles[2 * MAXIMUM_WAIT_OBJECTS];
+    int   req_idx[2 * MAXIMUM_WAIT_OBJECTS]; /* handles[i] -> reqs index, -1 = IPv6 */
     int n = 0;
     int i;
     DWORD wait_ms;
+    DWORD rc;
     int processed = 0;
 
-    /* collect IPv4 outstanding events */
+    /* collect IPv4 outstanding events, remembering which slot each handle
+     * belongs to so the drain below only touches live handles (<= 64)
+     * instead of scanning the whole 4096-slot array again. */
     for (i = 0; i < MAX_OUTSTANDING && n < MAXIMUM_WAIT_OBJECTS; i++) {
         if (reqs[i].used) {
             handles[n] = reqs[i].event;
+            req_idx[n] = i;
             n++;
         }
     }
 
-    /* collect IPv6 outstanding events (if any) */
-    n += socket6_collect_events(&handles[n], MAXIMUM_WAIT_OBJECTS);
+    /* collect IPv6 outstanding events (if any); mark them with -1 */
+    {
+        int v6 = socket6_collect_events(&handles[n], MAXIMUM_WAIT_OBJECTS);
+        for (i = 0; i < v6; i++)
+            req_idx[n + i] = -1;
+        n += v6;
+    }
 
     if (n == 0) {
         /* nothing outstanding: just sleep until the next event is due */
@@ -230,16 +240,29 @@ int wait_and_process_replies(int64_t timeout_ns)
     if (wait_ms == 0 && timeout_ns > 0)
         wait_ms = 1;
 
-    WaitForMultipleObjects(n, handles, FALSE, wait_ms);
+    rc = WaitForMultipleObjects(n, handles, FALSE, wait_ms);
     update_current_time();
 
-    /* drain all signalled IPv4 requests.  The events are manual-reset, so
-     * after WaitForMultipleObjects() every completed request is still
-     * signalled; we must ResetEvent() explicitly once it is handled. */
-    for (i = 0; i < MAX_OUTSTANDING; i++) {
-        if (reqs[i].used && WaitForSingleObject(reqs[i].event, 0) == WAIT_OBJECT_0) {
-            req_process(&reqs[i]);
-            ResetEvent(reqs[i].event);
+    /* Fast path: process the exact request the wait returned, using the
+     * signalled index instead of rescanning every slot. */
+    if (rc >= WAIT_OBJECT_0 && rc < WAIT_OBJECT_0 + (DWORD)n) {
+        int idx = req_idx[rc - WAIT_OBJECT_0];
+        if (idx >= 0 && reqs[idx].used) {
+            req_process(&reqs[idx]);
+            ResetEvent(reqs[idx].event);
+            processed++;
+        }
+    }
+
+    /* Drain any other IPv4 requests that also completed in the meantime,
+     * but only among the handles we actually waited on (n <= 64). */
+    for (i = 0; i < n; i++) {
+        int idx = req_idx[i];
+        if (idx < 0)
+            continue; /* IPv6 handled below */
+        if (reqs[idx].used && WaitForSingleObject(reqs[idx].event, 0) == WAIT_OBJECT_0) {
+            req_process(&reqs[idx]);
+            ResetEvent(reqs[idx].event);
             processed++;
         }
     }
