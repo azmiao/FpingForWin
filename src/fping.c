@@ -727,10 +727,11 @@ void main_loop(void)
             if (is_timeout) {
                 /* timeout for ping #idx */
                 num_timeout++;
+                /* loop/count: report each timed-out ping.  scan mode: the
+                 * "is unreachable" line is printed once in finish() only if
+                 * the host never answered (upstream behaviour). */
                 if (opt_loop || opt_count)
                     print_per_ping_timeout(h, idx);
-                else
-                    print_host_line(h, 0, 0, NULL);
                 stats_add(h, idx, 0, 0);
                 /* default mode: maybe retry (loop/count schedule on send) */
                 schedule_next_ping(h);
@@ -780,7 +781,7 @@ void usage(int rc)
     printf("   -r n       number of retries (default %d, not counting the first ping)\n", DEFAULT_RETRY);
     printf("   -s         print cumulative stats upon exit\n");
     printf("   -S addr    set source address\n");
-    printf("   -t n       individual target initial timeout (in ms) (default %d ms,\n");
+    printf("   -t n       individual target initial timeout (in ms) (default %d ms,\n", DEFAULT_TIMEOUT_MS);
     printf("              except with -l/-c/-C, where it's the -p period up to 2000 ms)\n");
     printf("   -u         show systems that are unreachable\n");
     printf("   -v         show version\n");
@@ -863,10 +864,15 @@ void finish(void)
     /* mark alive/unreachable hosts */
     for (i = 0; i < num_hosts; i++) {
         HOST_ENTRY *h = table[i];
-        if (h->num_recv > 0)
+        if (h->num_recv > 0) {
             num_alive++;
-        else
+        } else {
             num_unreachable++;
+            /* scan mode: print "is unreachable" once, here at the end,
+             * after all retries have failed (upstream finish()). */
+            if (!opt_loop && !opt_count)
+                print_host_line(h, 0, 0, NULL);
+        }
     }
 
     update_current_time();
