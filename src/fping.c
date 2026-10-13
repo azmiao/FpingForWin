@@ -27,36 +27,36 @@
 
 #define DEFAULT_PING_DATA_SIZE 56
 #define DEFAULT_TIMEOUT_MS     500
-#define DEFAULT_INTERVAL_MS    25
-#define DEFAULT_RETRY          0
+#define DEFAULT_INTERVAL_MS    10   /* upstream 4.0+: 10 ms */
+#define DEFAULT_RETRY          3    /* upstream default retry (not counting the first ping) */
+#define DEFAULT_BACKOFF        1.5  /* upstream exponential backoff factor */
+#define DEFAULT_PERIOD_MS      1000 /* upstream default per-target period (-p) in loop/count */
 #define DEFAULT_COUNT          0 /* 0 = loop mode */
+#define MAX_GENERATE           100000 /* upstream cap on -g generated targets */
 
 static int   opt_count          = DEFAULT_COUNT;
 static int   opt_loop           = 0; /* -l enables loop mode; default is single-shot + retry */
 static int64_t opt_timeout_ns   = DEFAULT_TIMEOUT_MS * 1000000LL;
+static int   opt_timeout_set    = 0; /* 1 if user gave -t explicitly */
 int64_t fping_timeout_ns        = DEFAULT_TIMEOUT_MS * 1000000LL; /* exposed to socket layer */
 static int64_t opt_interval_ns  = DEFAULT_INTERVAL_MS * 1000000LL;
 static int   opt_retry          = DEFAULT_RETRY;
-static int   opt_backoff        = 1; /* -B factor */
+static double opt_backoff       = DEFAULT_BACKOFF; /* -B factor */
 static int   opt_alive_flag     = 0; /* -a */
 static int   opt_unreachable    = 0; /* -u */
 static int   opt_quiet          = 0; /* -q */
-static int   opt_verbose        = 0; /* -v */
 static int   opt_stats          = 0; /* -s */
 static int   opt_size           = DEFAULT_PING_DATA_SIZE; /* -b */
-static int   opt_ttl            = 0; /* unused on windows API */
-static int   opt_show_latency   = 0;
-static int   opt_per_recv       = 0; /* -p (period, ms) */
+static int   opt_show_latency   = 0; /* -e (show elapsed round-trip time) */
+static int   opt_report_all_rtts = 0; /* -C: report per-ping rtts instead of stats */
 int64_t report_interval_ns = 0; /* -Q */
 static int   opt_print_timestamp = 0; /* -D */
-static int   opt_name_lookup    = 1;
 static int   opt_netdb          = 0; /* -n enables reverse-DNS names (default: numeric, like upstream -A) */
 static int   opt_ipv6           = 0; /* -6 */
-static int   opt_random_data    = 0;
 static char *opt_src_addr_str   = NULL; /* -S */
 static char *opt_filename       = NULL; /* -f */
 static int   opt_generate       = 0; /* -g implied */
-static int   opt_eliminate      = 0; /* -e (show elapsed) -- default on */
+static int64_t opt_perhost_interval_ns = DEFAULT_PERIOD_MS * 1000000LL; /* -p */
 
 /* ---- globals ------------------------------------------------------------ */
 
@@ -66,7 +66,6 @@ int max_hostname_len = 0;
 int64_t current_time_ns = 0;
 int64_t start_time = 0;
 int64_t end_time = 0;
-int64_t opt_perhost_interval = 0;
 
 static int socket4_opened = 0;
 static int socket6_opened = 0;
@@ -180,8 +179,13 @@ void add_addr(char *name, char *host, struct sockaddr *ipaddr, socklen_t ipaddr_
         (size_t)h->ring_size, sizeof(struct event));
     h->event_storage_timeout = (struct event *)calloc(
         (size_t)h->ring_size, sizeof(struct event));
-    if (opt_count > 0)
+    if (opt_count > 0) {
+        int k;
         h->resp_times = (int64_t *)calloc((size_t)(opt_count + 1), sizeof(int64_t));
+        /* upstream uses -1 as the "no reply yet" sentinel for -C output */
+        for (k = 0; k <= opt_count; k++)
+            h->resp_times[k] = -1;
+    }
 
     if ((int)strlen(host) > max_hostname_len)
         max_hostname_len = (int)strlen(host);
@@ -205,6 +209,11 @@ void add_addr_range_ipv4(unsigned long start, unsigned long end)
     struct in_addr a;
     unsigned long i;
     char buf[INET_ADDRSTRLEN];
+    if (end - start + 1 > MAX_GENERATE) {
+        fprintf(stderr, "fping: -g parameter generates %lu addresses, max is %d\n",
+                end - start + 1, MAX_GENERATE);
+        exit(1);
+    }
     for (i = start; i <= end; i++) {
         a.s_addr = htonl(i);
         inet_ntop(AF_INET, &a, buf, sizeof(buf));
@@ -400,103 +409,185 @@ void stats_add(HOST_ENTRY *h, int index, int success, int64_t latency)
     }
 }
 
-const char *sprint_tm(int64_t t)
+/* sprint_tm - format an ns duration the way upstream fping does:
+ * the precision shrinks as the value grows, so the output is always
+ * 3-4 significant digits (e.g. 0.467, 1.23, 12.3, 123, 1.23e+06). */
+const char *sprint_tm(int64_t t_ns)
 {
-    static char buf[32];
-    if (t < 1000)
-        snprintf(buf, sizeof(buf), "%.3g", (double)t);
-    else if (t < 1000000)
-        snprintf(buf, sizeof(buf), "%.2f", (double)t / 1000.0);
+    static char buf[16];
+    double t = (double)t_ns / 1000000.0; /* -> ms */
+    if (t < 0.0)
+        snprintf(buf, sizeof(buf), "%.2g", t);
+    else if (t < 1.0)
+        snprintf(buf, sizeof(buf), "%.3f", t);
+    else if (t < 10.0)
+        snprintf(buf, sizeof(buf), "%.2f", t);
+    else if (t < 100.0)
+        snprintf(buf, sizeof(buf), "%.1f", t);
+    else if (t < 1000000.0)
+        snprintf(buf, sizeof(buf), "%.0f", t);
     else
-        snprintf(buf, sizeof(buf), "%.2f", (double)t / 1000000.0);
+        snprintf(buf, sizeof(buf), "%.3e", t);
     return buf;
 }
 
 /* ---- output --------------------------------------------------------------- */
 
+static void print_timestamp_prefix(void)
+{
+    if (opt_print_timestamp) {
+        /* upstream: [%.5f] unix seconds with 5 decimal places (10us res) */
+        printf("[%.5f] ", win_wallclock_ns() / 1000000000.0);
+    }
+}
+
+/* scan/default mode single-line result ("host is alive" / "host is unreachable").
+ * In -a/-u mode the "is alive"/"is unreachable" suffix is omitted (upstream). */
 static void print_host_line(HOST_ENTRY *h, int success, int64_t latency, const char *reply_addr)
 {
-    /* -a: only alive hosts;  -u: only unreachable hosts.  These are the
-     * "scanning" modes and MUST print matching hosts even when quiet. */
+    (void)reply_addr;
     if (opt_alive_flag && !success)
         return;
     if (opt_unreachable && success)
         return;
-    /* plain -q/-c count mode: suppress per-ping output, but not -a/-u */
+    /* -q suppresses per-target output, but -a/-u are the whole point of -a/-u */
     if (opt_quiet && !opt_alive_flag && !opt_unreachable)
         return;
 
-    if (opt_print_timestamp) {
-        int64_t sec = win_wallclock_sec();
-        printf("[%lld] ", (long long)sec);
+    print_timestamp_prefix();
+    printf("%s", h->host);
+    if (!opt_alive_flag && !opt_unreachable) {
+        printf(success ? " is alive" : " is unreachable");
+        if (success && opt_show_latency)
+            printf(" (%s ms)", sprint_tm(latency));
     }
+    printf("\n");
+    if (opt_loop)
+        fflush(stdout);
+}
 
-    if (success) {
-        printf("%-s", h->host);
-        if ((opt_loop || opt_count) && !opt_alive_flag) {
-            /* per-recv mode (loop/count): always show the round-trip time,
-             * like upstream "xmt/rcv" per-ping output */
-            printf(" is alive (%.2f ms)", (double)latency / 1000000.0);
-        } else if (opt_alive_flag && !opt_show_latency && !opt_eliminate) {
-            /* upstream -a prints just the host name/address */
-        } else {
-            printf(" is alive");
-            if (opt_show_latency || opt_eliminate)
-                printf(" (%.2f ms)", (double)latency / 1000000.0);
-        }
-        printf("\n");
-    } else {
-        printf("%-s is unreachable\n", h->host);
-    }
-    /* Only flush per line in loop mode, where the user watches output live.
-     * In scan/count mode the stream is flushed once at exit (see finish()),
-     * which avoids a flush syscall per host on large scans. */
+/* per-ping reply in loop/count mode:
+ *   HOST : [SEQ], BYTES bytes, RTT ms (AVG avg, LOSS% loss)
+ * upstream prints the reply size (data + 8 icmp header, no IP header). */
+static void print_per_ping(HOST_ENTRY *h, int seq, int64_t latency)
+{
+    int64_t avg = h->num_recv > 0 ? h->total_time / h->num_recv : 0;
+    if (opt_quiet)
+        return;
+    print_timestamp_prefix();
+    printf("%-*s : [%d], %d bytes, %s ms",
+           max_hostname_len, h->host, seq, opt_size + 8, sprint_tm(latency));
+    printf(" (%s avg, ", sprint_tm(avg));
+    if (h->num_recv <= h->num_sent)
+        printf("%d%% loss)", h->num_sent > 0 ? ((h->num_sent - h->num_recv) * 100) / h->num_sent : 0);
+    else
+        printf("%d%% return)", h->num_sent > 0 ? (h->num_recv_total * 100) / h->num_sent : 0);
+    printf("\n");
+    if (opt_loop)
+        fflush(stdout);
+}
+
+/* per-ping timeout in loop/count mode:
+ *   HOST : [SEQ], timed out (NaN avg, 100% loss)   -- or (AVG avg, ..) if some replies */
+static void print_per_ping_timeout(HOST_ENTRY *h, int seq)
+{
+    if (opt_quiet)
+        return;
+    print_timestamp_prefix();
+    printf("%-*s : [%d], timed out", max_hostname_len, h->host, seq);
+    if (h->num_recv > 0)
+        printf(" (%s avg, ", sprint_tm(h->total_time / h->num_recv));
+    else
+        printf(" (NaN avg, ");
+    printf("%d%% loss)\n", h->num_sent > 0 ? ((h->num_sent - h->num_recv) * 100) / h->num_sent : 0);
     if (opt_loop)
         fflush(stdout);
 }
 
 void print_perhost_stats(void)
 {
-    int i;
-    printf("\n");
+    int i, j;
+    fprintf(stderr, "\n");
     for (i = 0; i < num_hosts; i++) {
         HOST_ENTRY *h = table[i];
         int sent = h->num_sent;
         int recv = h->num_recv;
-        int loss = sent > 0 ? (100 * (sent - recv)) / sent : 0;
-        printf("%-*s : xmt/rcv/%%loss = %d/%d/%d%%",
-               max_hostname_len, h->name, sent, recv, loss);
-        if (recv > 0) {
-            int64_t avg = h->total_time / recv;
-            printf(", min/avg/max = %.2f/%.2f/%.2f",
-                   (double)h->min_reply / 1000000.0,
-                   (double)avg / 1000000.0,
-                   (double)h->max_reply / 1000000.0);
+        fprintf(stderr, "%-*s :", max_hostname_len, h->name);
+        if (opt_report_all_rtts) {
+            /* -C: print one rtt per ping ("-" for no reply) instead of stats */
+            for (j = 0; j < sent; j++) {
+                if (h->resp_times && h->resp_times[j] >= 0)
+                    fprintf(stderr, " %s", sprint_tm(h->resp_times[j]));
+                else
+                    fprintf(stderr, " -");
+            }
+            fprintf(stderr, "\n");
+        } else {
+            int loss = sent > 0 ? (100 * (sent - recv)) / sent : 0;
+            fprintf(stderr, " xmt/rcv/%%loss = %d/%d/%d%%", sent, recv, loss);
+            if (recv > 0) {
+                int64_t avg = h->total_time / recv;
+                /* sprint_tm reuses a static buffer: emit each value separately */
+                fprintf(stderr, ", min/avg/max = %s", sprint_tm(h->min_reply));
+                fprintf(stderr, "/%s", sprint_tm(avg));
+                fprintf(stderr, "/%s", sprint_tm(h->max_reply));
+            }
+            fprintf(stderr, "\n");
         }
-        printf("\n");
     }
 }
 
 void print_global_stats(void)
 {
-    printf("\n");
-    printf("%7d targets\n", num_hosts);
-    printf("%7d alive\n", num_alive);
-    printf("%7d unreachable\n", num_unreachable);
-    printf("%7d unknown addresses\n", num_noaddress);
-    printf("\n");
-    printf("%7d timeouts (waiting for reply)\n", num_timeout);
-    printf("%7d ICMP Echos sent\n", num_pingsent);
-    printf("%7d ICMP Echo Replies received\n", num_pingreceived);
-    printf("%7d other ICMP received\n", num_othericmprcvd);
-    printf("\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, " %7d targets\n", num_hosts);
+    fprintf(stderr, " %7d alive\n", num_alive);
+    fprintf(stderr, " %7d unreachable\n", num_unreachable);
+    fprintf(stderr, " %7d unknown addresses\n", num_noaddress);
+    fprintf(stderr, "\n");
+    fprintf(stderr, " %7d timeouts (waiting for response)\n", num_timeout);
+    fprintf(stderr, " %7d ICMP Echos sent\n", num_pingsent);
+    fprintf(stderr, " %7d ICMP Echo Replies received\n", num_pingreceived);
+    fprintf(stderr, " %7d other ICMP received\n", num_othericmprcvd);
+    fprintf(stderr, "\n");
     if (total_replies > 0) {
-        printf(" %.2f ms (min round trip time)\n", (double)min_reply / 1000000.0);
-        printf(" %.2f ms (avg round trip time)\n", (double)sum_replies / (double)total_replies / 1000000.0);
-        printf(" %.2f ms (max round trip time)\n", (double)max_reply / 1000000.0);
+        /* sprint_tm reuses a static buffer: emit each value separately */
+        fprintf(stderr, " %s ms (min round trip time)\n", sprint_tm(min_reply));
+        fprintf(stderr, " %s ms (avg round trip time)\n", sprint_tm(sum_replies / total_replies));
+        fprintf(stderr, " %s ms (max round trip time)\n", sprint_tm(max_reply));
     }
-    printf(" %12.3f sec (elapsed real time)\n", (double)(end_time - start_time) / 1000000000.0);
-    printf("\n");
+    fprintf(stderr, " %12.3f sec (elapsed real time)\n", (double)(end_time - start_time) / 1000000000.0);
+    fprintf(stderr, "\n");
+}
+
+/* -Q interval summary: print a [HH:MM:SS] header then one line per host
+ * with the counters accumulated since the last report (upstream
+ * print_per_system_splits).  Resets the per-interval counters. */
+void print_interval_stats(void)
+{
+    int i;
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    fprintf(stderr, "\n");
+    if (tm)
+        fprintf(stderr, "[%2.2d:%2.2d:%2.2d]\n", tm->tm_hour, tm->tm_min, tm->tm_sec);
+    for (i = 0; i < num_hosts; i++) {
+        HOST_ENTRY *h = table[i];
+        int sent = h->num_sent_i;
+        int recv = h->num_recv_i;
+        int loss = sent > 0 ? (100 * (sent - recv)) / sent : 0;
+        fprintf(stderr, "%-*s : xmt/rcv/%%loss = %d/%d/%d%%",
+                max_hostname_len, h->host, sent, recv, loss);
+        if (recv > 0) {
+            /* sprint_tm reuses a static buffer: emit each value separately */
+            fprintf(stderr, ", min/avg/max = %s", sprint_tm(h->min_reply_i));
+            fprintf(stderr, "/%s", sprint_tm(h->total_time_i / recv));
+            fprintf(stderr, "/%s", sprint_tm(h->max_reply_i));
+        }
+        fprintf(stderr, "\n");
+        stats_reset_interval(h);
+    }
+    fflush(stderr);
 }
 
 /* ---- send / receive glue --------------------------------------------------- */
@@ -517,6 +608,9 @@ int send_ping(HOST_ENTRY *h, int index)
         h->num_sent_i++;
         num_pingsent++;
         h->last_send_time = current_time_ns;
+        /* exponential backoff for the next retry of this target (upstream
+         * does h->timeout *= backoff after every send) */
+        h->timeout = (int64_t)(h->timeout * opt_backoff);
     }
     return rc;
 }
@@ -551,22 +645,18 @@ void handle_reply(HOST_ENTRY *h, int seq_nr, int64_t latency_ns, int success,
         stats_add(h, seq_nr, 1, latency_ns);
         if (opt_loop || opt_count) {
             /* per-recv mode: print every reply (upstream print_recv) */
-            if (!opt_quiet)
-                print_host_line(h, 1, latency_ns, reply_addr);
+            print_per_ping(h, seq_nr, latency_ns);
         } else if (h->num_recv == 1) {
             /* scan/default mode: print "is alive" only on the FIRST reply
              * for this host (upstream: if (h->num_recv == 1)) */
-            if (opt_alive_flag || opt_unreachable || opt_verbose)
-                print_host_line(h, 1, latency_ns, reply_addr);
+            print_host_line(h, 1, latency_ns, reply_addr);
         }
     } else {
         /* error from the echo request itself (e.g. host unreachable) */
         num_othericmprcvd++;
         stats_add(h, seq_nr, 0, 0);
-        if (opt_loop || opt_count) {
-            if (!opt_quiet)
-                print_host_line(h, 0, 0, NULL);
-        }
+        if (opt_loop || opt_count)
+            print_per_ping_timeout(h, seq_nr);
     }
 
     /* cancel the pending timeout event for this ping */
@@ -596,7 +686,10 @@ static void schedule_initial_pings(void)
 
 void main_loop(void)
 {
+    int64_t next_report = 0;
     update_current_time();
+    if (report_interval_ns > 0)
+        next_report = current_time_ns + report_interval_ns;
 
     while (!sigint_received) {
         struct event *ev = ev_queue.first;
@@ -608,12 +701,21 @@ void main_loop(void)
         }
 
         wait_ns = ev->ev_time - current_time_ns;
+        /* wake up in time for the next -Q interval report, if sooner */
+        if (report_interval_ns > 0 && next_report - current_time_ns < wait_ns)
+            wait_ns = next_report - current_time_ns;
         if (wait_ns < 0)
             wait_ns = 0;
 
         /* block until a reply arrives or the event is due */
         wait_and_process_replies(wait_ns);
         update_current_time();
+
+        /* -Q: time for the periodic interval summary? */
+        if (report_interval_ns > 0 && current_time_ns >= next_report) {
+            print_interval_stats();
+            next_report += report_interval_ns;
+        }
 
         /* process all events that are now due */
         while (ev_queue.first && ev_queue.first->ev_time <= current_time_ns) {
@@ -625,8 +727,10 @@ void main_loop(void)
             if (is_timeout) {
                 /* timeout for ping #idx */
                 num_timeout++;
-                h->num_sent_i++; /* count as sent for interval stats */
-                print_host_line(h, 0, 0, NULL);
+                if (opt_loop || opt_count)
+                    print_per_ping_timeout(h, idx);
+                else
+                    print_host_line(h, 0, 0, NULL);
                 stats_add(h, idx, 0, 0);
                 /* default mode: maybe retry (loop/count schedule on send) */
                 schedule_next_ping(h);
@@ -634,8 +738,9 @@ void main_loop(void)
                 /* time to send ping #idx */
                 int rc = send_ping(h, idx);
                 if (rc == 0) {
+                    /* h->timeout already has the backoff applied (see send path) */
                     host_add_timeout_event(h, idx,
-                        current_time_ns + h->timeout * opt_backoff);
+                        current_time_ns + h->timeout);
                     /* loop & count mode: schedule the next ping right after
                      * sending (mirrors upstream fping main loop) */
                     if (opt_loop || (opt_count && idx + 1 < opt_count)) {
@@ -658,9 +763,9 @@ void usage(int rc)
     printf("   -a         show systems that are alive\n");
     printf("   -A         show targets by address\n");
     printf("   -b n       amount of ping data to send, in bytes (default %d)\n", DEFAULT_PING_DATA_SIZE);
-    printf("   -B f       set exponential backoff factor to f\n");
+    printf("   -B f       set exponential backoff factor to f (default %.1f)\n", DEFAULT_BACKOFF);
     printf("   -c n       count mode: send n pings to each target\n");
-    printf("   -C n       same as -c, report results in verbose format\n");
+    printf("   -C n       same as -c, report one rtt per ping instead of stats\n");
     printf("   -D         print unix timestamp before each output line\n");
     printf("   -e         show elapsed (round-trip) time on packets\n");
     printf("   -f file    read list of targets from a file ( - means stdin)\n");
@@ -669,13 +774,14 @@ void usage(int rc)
     printf("   -i n       interval between sending ping packets (in ms) (default %d)\n", DEFAULT_INTERVAL_MS);
     printf("   -l         loop mode: send pings forever\n");
     printf("   -n         show targets by name (reverse DNS)\n");
-    printf("   -p n       period between pings to one target (in ms) (in loop/count mode)\n");
+    printf("   -p n       period between pings to one target (in ms) (in loop/count mode, default %d)\n", DEFAULT_PERIOD_MS);
     printf("   -q         quiet (don't show per-target/per-ping results)\n");
     printf("   -Q n       same as -q, but show summary every n seconds\n");
-    printf("   -r n       number of retries (default %d)\n", DEFAULT_RETRY);
+    printf("   -r n       number of retries (default %d, not counting the first ping)\n", DEFAULT_RETRY);
     printf("   -s         print cumulative stats upon exit\n");
     printf("   -S addr    set source address\n");
-    printf("   -t n       individual target initial timeout (in ms) (default %d)\n", DEFAULT_TIMEOUT_MS);
+    printf("   -t n       individual target initial timeout (in ms) (default %d ms,\n");
+    printf("              except with -l/-c/-C, where it's the -p period up to 2000 ms)\n");
     printf("   -u         show systems that are unreachable\n");
     printf("   -v         show version\n");
     printf("   -6         use IPv6 instead of IPv4\n");
@@ -766,9 +872,10 @@ void finish(void)
     update_current_time();
     end_time = current_time_ns;
 
-    /* per-host stats: shown in count mode, or when stats are requested,
-     * but not in -a/-u "show only alive/unreachable" scanning mode */
-    if ((opt_count > 0 || opt_stats) && !opt_alive_flag && !opt_unreachable)
+    /* per-host stats: count mode prints them for every target; -a/-u scanning
+     * mode suppresses them (upstream prints stats even in -a mode when -s is
+     * given, but keeps the common case clean). */
+    if (opt_count > 0 || (opt_stats && !opt_alive_flag && !opt_unreachable))
         print_perhost_stats();
     if (opt_stats)
         print_global_stats();
@@ -790,23 +897,21 @@ int main(int argc, char **argv)
         return 4;
     }
 
-    /* defaults */
-    opt_eliminate = 0;   /* latency shown only with -e (or count-mode stats) */
-    opt_show_latency = 0;
-
     optparse_init(&opts, argv);
     while ((c = optparse_long(&opts, longopts, &longindex)) != -1) {
         switch (c) {
-        case 'a': opt_alive_flag = 1; opt_quiet = 1; break;
+        case 'a': opt_alive_flag = 1; break;
         case 'A': opt_netdb = 0; break;
         case 'b': opt_size = atoi(opts.optarg); break;
-        case 'B': opt_backoff = atoi(opts.optarg); if (opt_backoff < 1) opt_backoff = 1; break;
+        case 'B': opt_backoff = atof(opts.optarg); if (opt_backoff < 1.0) opt_backoff = 1.0; break;
         case 'c':
+            opt_count = atoi(opts.optarg);
+            opt_loop = 0;
+            break;
         case 'C':
             opt_count = atoi(opts.optarg);
             opt_loop = 0;
-            opt_quiet = 1;
-            opt_stats = 1;
+            opt_report_all_rtts = 1;
             break;
         case 'D': opt_print_timestamp = 1; break;
         case 'e': opt_show_latency = 1; break;
@@ -816,9 +921,7 @@ int main(int argc, char **argv)
         case 'l': opt_loop = 1; break;
         case 'n': opt_netdb = 1; break;
         case 'p':
-            opt_per_recv = 1;
-            opt_perhost_interval = (int64_t)atoi(opts.optarg) * 1000000LL;
-            opt_interval_ns = opt_perhost_interval;
+            opt_perhost_interval_ns = (int64_t)atoi(opts.optarg) * 1000000LL;
             break;
         case 'q': opt_quiet = 1; break;
         case 'Q':
@@ -828,8 +931,12 @@ int main(int argc, char **argv)
         case 'r': opt_retry = atoi(opts.optarg); break;
         case 's': opt_stats = 1; break;
         case 'S': opt_src_addr_str = opts.optarg; break;
-        case 't': opt_timeout_ns = (int64_t)atoi(opts.optarg) * 1000000LL; fping_timeout_ns = opt_timeout_ns; break;
-        case 'u': opt_unreachable = 1; opt_quiet = 1; break;
+        case 't':
+            opt_timeout_ns = (int64_t)atoi(opts.optarg) * 1000000LL;
+            opt_timeout_set = 1;
+            fping_timeout_ns = opt_timeout_ns;
+            break;
+        case 'u': opt_unreachable = 1; break;
         case 'v':
             printf("fping for Windows, version 1.0.0\n");
             printf("based on fping by Roland Schemers et al.\n");
@@ -851,6 +958,19 @@ int main(int argc, char **argv)
 
     if (opt_size < 0 || opt_size > 1024)
         opt_size = DEFAULT_PING_DATA_SIZE;
+
+    /* loop/count mode: the per-target period (-p) drives the send interval,
+     * and (unless -t was given) the timeout defaults to the period,
+     * capped at 2000 ms -- mirroring upstream autotune behaviour. */
+    if (opt_loop || opt_count) {
+        opt_interval_ns = opt_perhost_interval_ns;
+        if (!opt_timeout_set) {
+            opt_timeout_ns = opt_perhost_interval_ns;
+            if (opt_timeout_ns > 2000LL * 1000000LL)
+                opt_timeout_ns = 2000LL * 1000000LL;
+            fping_timeout_ns = opt_timeout_ns;
+        }
+    }
 
     /* open sockets */
     if (opt_ipv6) {

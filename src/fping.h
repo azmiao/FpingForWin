@@ -63,7 +63,6 @@ extern int max_hostname_len;
 extern int64_t current_time_ns;
 extern int64_t start_time;
 extern int64_t end_time;
-extern int64_t opt_perhost_interval;
 extern int64_t report_interval_ns;
 
 /* stats globals (defined in stats.c) */
@@ -111,6 +110,7 @@ void stats_add(HOST_ENTRY *h, int index, int success, int64_t latency);
 void update_current_time(void);
 void print_perhost_stats(void);
 void print_global_stats(void);
+void print_interval_stats(void);
 void crash_and_burn(char *message);
 void errno_crash_and_burn(char *message);
 

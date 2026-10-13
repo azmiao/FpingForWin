@@ -54,10 +54,17 @@ static __inline int64_t win_now_ns(void)
     return (int64_t)((counter.QuadPart * 1000000000LL) / freq.QuadPart);
 }
 
-/* wall clock seconds (for -D timestamp) */
-static __inline int64_t win_wallclock_sec(void)
+/* wall clock in nanoseconds (for -D timestamp, 10us resolution like upstream).
+ * Uses GetSystemTimeAsFileTime (100ns ticks since 1601) converted to unix epoch. */
+static __inline int64_t win_wallclock_ns(void)
 {
-    return (int64_t)time(NULL);
+    FILETIME ft;
+    ULARGE_INTEGER u;
+    GetSystemTimeAsFileTime(&ft);
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    /* 11644473600 = seconds between 1601-01-01 and 1970-01-01 */
+    return (int64_t)(u.QuadPart - 11644473600ULL * 10000000ULL) * 100;
 }
 
 #endif /* _WINP_H */
