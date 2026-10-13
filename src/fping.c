@@ -448,7 +448,11 @@ static void print_host_line(HOST_ENTRY *h, int success, int64_t latency, const c
     } else {
         printf("%-s is unreachable\n", h->host);
     }
-    fflush(stdout);
+    /* Only flush per line in loop mode, where the user watches output live.
+     * In scan/count mode the stream is flushed once at exit (see finish()),
+     * which avoids a flush syscall per host on large scans. */
+    if (opt_loop)
+        fflush(stdout);
 }
 
 void print_perhost_stats(void)
